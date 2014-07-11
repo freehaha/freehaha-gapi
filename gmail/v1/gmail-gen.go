@@ -10,12 +10,14 @@
 package gmail
 
 import (
+	"bufio"
 	"bytes"
 	"code.google.com/p/google-api-go-client/googleapi"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -1665,12 +1667,105 @@ type UsersMessagesGetCall struct {
 	opt_   map[string]interface{}
 }
 
+type UsersMessagesBatchGetCall struct {
+	calls []*UsersMessagesGetCall
+	s     *Service
+}
+
 // Get: Gets the specified message.
 func (r *UsersMessagesService) Get(userId string, id string) *UsersMessagesGetCall {
 	c := &UsersMessagesGetCall{s: r.s, opt_: make(map[string]interface{})}
 	c.userId = userId
 	c.id = id
 	return c
+}
+
+func (r *UsersMessagesService) BatchGet(userId string, ids []string) *UsersMessagesBatchGetCall {
+	calls := make([]*UsersMessagesGetCall, 0, 5)
+	for _, id := range ids {
+		c := &UsersMessagesGetCall{s: r.s, opt_: make(map[string]interface{})}
+		c.userId = userId
+		c.id = id
+		calls = append(calls, c)
+	}
+	return &UsersMessagesBatchGetCall{calls: calls, s: r.s}
+}
+
+func (bcall *UsersMessagesBatchGetCall) Do() (map[string]*Message, error) {
+	messages := make(map[string]*Message)
+	basePath := "https://www.googleapis.com/batch"
+	var content bytes.Buffer
+	for i, c := range bcall.calls {
+		content.WriteString("--batch_getmsgs\r\n")
+		params := make(url.Values)
+		params.Set("alt", "json")
+		if v, ok := c.opt_["format"]; ok {
+			params.Set("format", fmt.Sprintf("%v", v))
+		}
+		urls := "/gmail/v1/users/{userId}/messages/{id}"
+		urls += "?" + params.Encode()
+
+		urls = strings.Replace(urls, "{userId}", url.QueryEscape(c.userId), 1)
+		urls = strings.Replace(urls, "{id}", url.QueryEscape(c.id), 1)
+
+		content.WriteString("Content-Type: application/http\r\n")
+		content.WriteString(fmt.Sprintf("Content-ID: item-%d\r\n\r\n", i))
+		content.WriteString("GET ")
+		content.WriteString(urls)
+		content.WriteString("\r\n\r\n")
+	}
+	content.WriteString("--batch_getmsgs--")
+	body := bytes.NewReader(content.Bytes())
+	req, err := http.NewRequest("POST", basePath, body)
+	googleapi.SetOpaque(req.URL)
+	req.Header.Set("Content-Type", "multipart/mixed; boundary=batch_getmsgs")
+	req.Header.Set("User-Agent", "google-api-go-client/0.5")
+	req.ContentLength = int64(content.Len())
+	res, err := bcall.s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer googleapi.CloseBody(res)
+	if err := googleapi.CheckResponse(res); err != nil {
+		return nil, err
+	}
+
+	ctype := res.Header.Get("Content-Type")
+
+	// mime.ParseMediaType doesn't parse boundary with '=' in it very well..
+	// we'll just get the boundary after =
+	/*
+	 * _, params, err := mime.ParseMediaType(ctype)
+	 * if err != nil {
+	 * 	fmt.Printf("mime type parse error %s %s\n", ctype, err)
+	 * }
+	 * fmt.Printf("%s, %s\n", boundary, params)
+	 */
+
+	i := strings.Index(ctype, "=")
+	boundary := ctype[i+1:]
+
+	defer res.Body.Close()
+	reader := multipart.NewReader(res.Body, boundary)
+	for {
+		p, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// FIXME find a way to deliver this error
+			continue
+		}
+		respReader := bufio.NewReader(p)
+		msgRes, _ := http.ReadResponse(respReader, nil)
+		var ret *Message
+		if err := json.NewDecoder(msgRes.Body).Decode(&ret); err != nil {
+			return nil, err
+		}
+		messages[ret.Id] = ret
+	}
+
+	return messages, nil
 }
 
 // Format sets the optional parameter "format": The format to return the
